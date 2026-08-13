@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+
+  /* Visible keyboard focus everywhere — accessibility floor, not optional */
+  :focus-visible {
+    outline: 2px solid theme("colors.secondary.DEFAULT");
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .status-dot {
+    @apply inline-block w-2.5 h-2.5 rounded-full;
+  }
+  .status-dot--mastered { @apply bg-success; }
+  .status-dot--weak { @apply bg-warn; }
+  .status-dot--untouched { @apply bg-primary-light/30; }
+
+  /* Signature interactive element for the playful direction: a solid-color
+     "pressed" shadow instead of a soft drop shadow, with a real press
+     animation on click — this is the one visual risk this design leans on,
+     so it appears only on primary actions, never decoratively. */
+  .btn-3d {
+    @apply font-display font-bold rounded-full px-6 py-3 text-paper
+           bg-primary shadow-press shadow-primary-dark
+           transition-transform duration-75 ease-out
+           active:translate-y-1 active:shadow-none
+           disabled:opacity-50 disabled:active:translate-y-0 disabled:active:shadow-press;
+  }
+  .btn-3d--secondary {
+    @apply bg-secondary shadow-secondary-dark;
+  }
+}
