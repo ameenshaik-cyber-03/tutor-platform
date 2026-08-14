@@ -18,6 +18,19 @@ const requestSchema = z.object({
 });
 
 // Validates the LLM's JSON output before it ever touches the database.
+// nodeType is validated as a plain string, not z.enum(...).catch(...) — that
+// combination has an inconsistent TypeScript output type across Zod patch
+// versions. Validating loosely here and normalizing explicitly in code below
+// has an output type that can't drift between Zod versions.
+const VALID_NODE_TYPES = ["concept", "dsa", "mcq", "hr", "aptitude", "core_subject"] as const;
+type NodeType = (typeof VALID_NODE_TYPES)[number];
+
+function normalizeNodeType(value: string | undefined): NodeType {
+  return (VALID_NODE_TYPES as readonly string[]).includes(value ?? "")
+    ? (value as NodeType)
+    : "concept"; // falls back if the model omits it or sends something invalid
+}
+
 const nodeSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -25,12 +38,7 @@ const nodeSchema = z.object({
   summary: z.string(),
   difficulty: z.enum(["foundational", "intermediate", "advanced"]),
   dependsOn: z.array(z.string()),
-  // Falls back to "concept" if the model omits it (shouldn't happen given the
-  // prompt, but a missing/invalid nodeType would otherwise fail the whole
-  // generation — better to degrade gracefully than 502 on a minor field).
-  nodeType: z
-    .enum(["concept", "dsa", "mcq", "hr", "aptitude", "core_subject"])
-    .catch("concept"),
+  nodeType: z.string().optional(),
 });
 
 const conceptMapSchema = z.object({
@@ -38,8 +46,6 @@ const conceptMapSchema = z.object({
   nodes: z.array(nodeSchema).min(1),
 });
 
-// Normalizes a topic/role into a stable cache key — same topic, different
-// casing/whitespace, should still hit the cache.
 function buildCacheKey(mode: string, topicOrRole: string, companyTier?: string): string {
   return `${mode}:${topicOrRole.trim().toLowerCase()}:${(companyTier ?? "").trim().toLowerCase()}`;
 }
@@ -54,10 +60,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
-  // This is the most expensive call in the app (generates 6-12 nodes worth
-  // of curriculum), so it gets the tightest limit: 8 per 10 minutes. Applies
-  // even on cache hits — the write side (concept_maps/concept_nodes inserts)
-  // still costs real DB work per request regardless of whether the LLM ran.
   const allowed = await enforceRateLimit(supabase, user.id, "concept-map-generate", 8, 600);
   if (!allowed) {
     return NextResponse.json(
@@ -73,7 +75,6 @@ export async function POST(req: NextRequest) {
   const { mode, topicOrRole, companyTier, projectId } = parsed.data;
   const cacheKey = buildCacheKey(mode, topicOrRole, companyTier);
 
-  // --- Check the cache before spending an LLM call ---
   let conceptMapData: z.infer<typeof conceptMapSchema> | null = null;
 
   const { data: cached } = await supabase
@@ -86,11 +87,8 @@ export async function POST(req: NextRequest) {
     const validatedCache = conceptMapSchema.safeParse(cached.generated_json);
     if (validatedCache.success) {
       conceptMapData = validatedCache.data;
-      // Best-effort bookkeeping — a failure here shouldn't affect the response.
       void supabase.rpc("bump_cache_hit", { p_cache_key: cacheKey });
     }
-    // If the cached JSON somehow fails validation (schema drift over time),
-    // fall through and regenerate rather than serving broken data.
   }
 
   if (!conceptMapData) {
@@ -111,9 +109,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Best-effort cache write. Ignore failures (e.g. a race where two users
-    // requested the same new topic simultaneously and both tried to insert) —
-    // the request should still succeed even if caching it didn't.
     await supabase
       .from("concept_map_cache")
       .insert({ cache_key: cacheKey, generated_json: conceptMapData })
@@ -123,7 +118,6 @@ export async function POST(req: NextRequest) {
       );
   }
 
-  // --- Persist: one row in concept_maps, one row per node in concept_nodes ---
   const { data: conceptMap, error: mapError } = await supabase
     .from("concept_maps")
     .insert({
@@ -146,11 +140,11 @@ export async function POST(req: NextRequest) {
     concept_map_id: conceptMap.id,
     slug: node.id,
     title: node.title,
-    parent_id: null, // resolved in a second pass below once IDs exist
+    parent_id: null,
     summary: node.summary,
     difficulty: node.difficulty,
     depends_on: node.dependsOn,
-    node_type: node.nodeType,
+    node_type: normalizeNodeType(node.nodeType),
     position: index,
   }));
 
